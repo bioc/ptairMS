@@ -30,7 +30,7 @@ detectPeak(
   minIntensityRate = 0.01,
   mzNominal = NULL,
   resolutionRange = NULL,
-  fctFit = "averagePeak",
+  fctFit = NULL,
   smoothPenalty = NULL,
   timeLimit,
   knots = NULL,
@@ -133,12 +133,11 @@ for each nominal mass:
 library(ptairData)
 filePath <- system.file('extdata/exhaledAir/ind1', 'ind1-1.h5', 
 package = 'ptairData')
-raw <- readRaw(filePath,mzCalibRef=c(21.022,59.049))
+raw <- readRaw(filePath,mzCalibRef=c(21.022,59.049),calib=TRUE)
 timeLimit<-timeLimits(raw,fracMaxTIC=0.7)
 knots<-defineKnots(object = raw,timeLimit=timeLimit)
-peakList <- detectPeak(raw, timeLimit=timeLimit, mzNominal = c(21,59),
-smoothPenalty=0,knots=knots)
-Biobase::fData(peakList)
+raw <- detectPeak(raw, timeLimit=timeLimit, mzNominal = c(21,59),
+smoothPenalty=0,knots=knots,resolutionRange=c(2000,5000,8000))
 
 ## For a ptrSet object
 library(ptairData)

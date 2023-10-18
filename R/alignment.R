@@ -32,12 +32,12 @@ align <- function(peakTab, ppmGroup = 70, dmzGroup = 0.001) {
     # Cuts the mass axis into 1 Da size intervals around the nominal mass
     
     nPoints <- 1024
-    mzrange <- range(peaksL[, 1])
+    mzrange <- range(peaksL[, "Mz"])
     inter = 1
     massInter <- seq(floor(mzrange[1]) - 0.5, ceiling(mzrange[2]) + 0.5, inter)
     
     # Find the position of peaksL in massInter
-    masspos <- findEqualGreaterM(peaksL[, 1], massInter)
+    masspos <- findEqualGreaterM(peaksL[, "Mz"], massInter)
     
     # Initialize variables The list who will be return, contains each group of same
     # masses
@@ -56,9 +56,12 @@ align <- function(peakTab, ppmGroup = 70, dmzGroup = 0.001) {
         
         # calculated the density Determining the base of the signal to skip for a
         # resolution.
-        bw <- max(massInter[i] * ppmGroup/(10^6), dmzGroup)
-        den <- stats::density(subpeakl[, "Mz"], bw, from = massInter[i] - bw, 
-                                to = massInter[i + 1] + bw, n = 1024)
+            bw <- max(massInter[i] * ppmGroup/(10^6), dmzGroup)
+            den <- stats::density(subpeakl[, "Mz"], bw, from = massInter[i] - bw, 
+                                    to = massInter[i + 1] + bw, n = 1024)
+        
+        
+
         maxy <- max(den$y)
         den$y[which(den$y <= bw * maxy)] <- 0
         plim <- list(linflex = -1, rinflex = 0, state = 0)
@@ -303,16 +306,17 @@ alignSamplesFunc <- function(peakList, sampleMetadata, ppmGroup = 100,
                                 pValGreaterThres = 0.005, pValLessThres = 0, 
                                 fracExp = 0.3, 
                                 quantiUnit = c("ppb", "ncps", "cps")[1], 
-                                bgCorrected = TRUE) {
+                                bgCorrected = FALSE) {
     
     
-    peakList <- lapply(peakList, 
+    peakList <- lapply(peakList,
                        function(x) {
-                           
-                           x<-as.data.table(Biobase::fData(x)[, -c(2,3, 4)])
-                           
-                           
+
+                          # x<-as.data.table(Biobase::fData(x)[, -c(2,3, 4)])
+                           x<-as.data.table(Biobase::fData(x))
+
                            })
+    
     testquantiUnit <- Reduce(c, lapply(peakList, function(x) {
         x <- as.matrix(x)
         all(is.na(x[, paste0("quanti_", quantiUnit)]))
@@ -368,17 +372,17 @@ alignSamplesFunc <- function(peakList, sampleMetadata, ppmGroup = 100,
     
     
     ## add column group with Samples group number
-    mat <- NULL
+    mat <- data.frame(NULL)
     peakList <- lapply(peakList, function(x) as.matrix(x))
     
     for (i in seq_along(peakList)) {
         mat_temp <- cbind(peakList[[i]], group = i)
-        mat <- rbind(mat, mat_temp)
+        mat <- plyr::rbind.fill(mat, as.data.frame(mat_temp))
     }
     
     
     # make subgroup of peak
-    groupList <- align(as.matrix(mat), ppmGroup, dmzGroup)
+    groupList <- align(peakTab = as.matrix(mat), ppmGroup, dmzGroup)
     
     # Get number of samples
     nSample <- length(peakList)
@@ -395,6 +399,7 @@ alignSamplesFunc <- function(peakList, sampleMetadata, ppmGroup = 100,
     
     # formatting the final matrix
     mat.final.Exp <- apply(groupMat[, c("quanti", "Samples")], MARGIN = 1, function(x) {
+        x<-as.matrix(x)
         output <- rep(NA, nSample)
         ch.Area <- x[1]
         ch.Area.split <- strsplit(ch.Area, split = "_")[[1]]
@@ -594,6 +599,156 @@ fliterEset <- function(X, sampleMetadata, groupMat, groupList, peakList, group,
     return(list(X = X, Xbg = Xbg))
 }
 
+imputeRaw <- function(X, raw, timeLimit,quanti="ppb") {
+    
+    missingValues <- which(is.na(X), arr.ind = TRUE)
+    indexFilesMissingValues <- unique(missingValues[, "col"])
+    namesFilesMissingValues <- colnames(X)[indexFilesMissingValues]
+    
+    fctFit <- raw@fctFit
+    l.shape <-raw@peakShape
+    
+    primaryIon <- raw@primaryIon
+    filesFullName <- raw@name
+    
+    if (methods::is(filesFullName, "expression")) 
+        filesFullName <- eval(filesFullName)
+    
+
+    filesFullName.j <- filesFullName
+    
+    # peak list raw
+    peakList<-raw@peakList
+    peakListRaw.j <- Biobase::fData(peakList)
+    quantiImpute <- list()
+    mzMissing <- as.numeric(rownames(missingValues))
+    
+    
+    # open mz Axis
+    mzAxis <- raw@mz 
+    indexMzList <- lapply(unique(round(mzMissing)), function(m) which(m - 0.6 < mzAxis & 
+                                                                          mzAxis < m + 0.6))
+    names(indexMzList) <- unique(round(mzMissing))
+    indexMz <- Reduce(union, indexMzList)
+    
+    # get index time
+    indexLim <- timeLimit$exp
+    indexTime <- Reduce(c, apply(indexLim, 2, function(x) seq(x["start"], x["end"])))
+    
+    nbExp <- ncol(indexLim)
+    
+    # open raw data
+    #raw <- rhdf5::h5read(filesFullName.j, name = "/FullSpectra/TofData", 
+    #                     index = list(indexMz, NULL, NULL, NULL))
+    
+    rawMn <- raw@rawM 
+    # * 0.2 ns / 2.9 (single ion signal) if convert to cps
+    
+    # information for ppb convertion
+    reaction <- try(reaction <- rhdf5::h5read(filesFullName.j, "AddTraces/PTR-Reaction"))
+    transmission <- try(rhdf5::h5read(filesFullName.j, "PTR-Transmission"))
+    
+ 
+    
+    for (m in unique(round(mzMissing))) {
+        # exact missing mz
+        mz <- mzMissing[round(mzMissing) == m]
+        
+        # mzAxis around m
+        mzAxis.m <- mzAxis[which(m - 0.6 < mzAxis & 
+                                     mzAxis < m + 0.6)]
+        
+        indexExp <- Reduce(c, apply(indexLim, 2, function(x) seq(x[1], x[2])))
+        length.exp <- length(indexExp)
+        
+        quantiMat <- matrix(0, ncol = length(mz), nrow = nbExp)
+        
+        spectrum <- rowSums(rawMn[ which(m - 0.6 < mzAxis & 
+                                             mzAxis < m + 0.6), 
+                                  indexExp])/(length.exp * (diff(raw@time[c(1,2)])))
+        
+        spectrum <- spectrum - snipBase(spectrum)
+        
+        # substract fitted peak also find
+        peakAlsoDetected <- peakListRaw.j[round(peakListRaw.j$Mz) == m, ]
+        if (nrow(peakAlsoDetected) != 0) {
+            # cumFitPeak
+            
+            fitPeaks <- apply(peakAlsoDetected, 1, 
+                              function(x) eval(parse(text = fctFit))(x["Mz"], x["parameterPeak.delta1"], x["parameterPeak.delta2"], x["parameterPeak.heigh"], 
+                                                                     x = mzAxis.m, l.shape = l.shape))
+            if (nrow(peakAlsoDetected) > 1) 
+                cumFitPeak <- rowSums(fitPeaks) else cumFitPeak <- c(fitPeaks)
+                spectrum <- spectrum - cumFitPeak
+        }
+        
+        # fit on the missing values
+        resolutionrange<-raw@resolution
+        resolution_upper <- resolutionrange[3]
+        resolution_mean <- resolutionrange[2]
+        resolution_lower <- resolutionrange[1]
+        
+        n.peak <- length(mz)
+        delta <- rep(m/resolution_mean, 2 * n.peak)
+        h <- vapply(mz, function(m) max(max(spectrum[which(abs(mzAxis.m - m) < (m * 
+                                                                                    50/10^6))]), 1), 0)
+        
+        
+        initMz <- matrix(c(mz, delta, h), nrow = n.peak)
+        colnames(initMz) <- c("m", "delta1", "delta2", "h")
+        
+        
+        lower.cons <- c(t(initMz * matrix(c(rep(1, n.peak), rep(0, n.peak * 2), rep(0.1, 
+                                                                                    n.peak)), ncol = 4) - matrix(c(initMz[, "m"]/(resolution_mean * 100), 
+                                                                                                                   -initMz[, "m"]/(resolution_lower * 2), -initMz[, "m"]/(resolution_lower * 
+                                                                                                                                                                              2), rep(0, n.peak)), ncol = 4)))
+        
+        upper.cons <- c(t(initMz * matrix(c(rep(1, n.peak), rep(0, n.peak * 2), rep(Inf, 
+                                                                                    n.peak)), ncol = 4) + matrix(c(initMz[, "m"]/(resolution_mean * 100), 
+                                                                                                                   initMz[, "m"]/(resolution_upper * 2), initMz[, "m"]/(resolution_upper * 
+                                                                                                                                                                            2), rep(0, n.peak)), ncol = 4)))
+        
+        
+        fit <- fitPeak(initMz = initMz, sp = spectrum, mz.i = mzAxis.m, lower.cons, 
+                       upper.cons, funcName = fctFit, l.shape = l.shape)
+        
+        fit.peak <- fit$fit.peak
+        par_estimated <- fit$par_estimated
+        
+        
+        quanti.m <- apply(par_estimated, 2, function(x) {
+            th <- 10 * 0.5 * (log(sqrt(2) + 1)/x[2] + log(sqrt(2) + 1)/x[3])
+            mz.x <- mzAxis.m[x[1] - th < mz & mz < x[1] + th]
+            sum(eval(parse(text = fctFit))(x[1], x[2], x[3], x[4], mz.x, l.shape), 
+                na.rm = TRUE)
+        })
+        
+        list_peak <- cbind(Mz = mz, quanti = quanti.m/(primaryIon * 
+                                                           488))
+        
+        # convert to ppb or ncps if there is reaction ans transmission information
+        if (quanti == "ppb") {
+            U <- c(reaction$TwData[1, , ])
+            Td <- c(reaction$TwData[3, , ])
+            pd <- c(reaction$TwData[2, , ])
+            quanti.m <- ppbConvert(peakList = list_peak, transmission = transmission$Data, 
+                                   U = U[indexExp], Td = Td[indexExp], pd = pd[indexExp])
+            
+        }
+        if (quanti == "ncps") {
+            # normalize by primary ions
+            quanti.m <- quanti.m/(primaryIon * 488)
+        }
+        
+       
+            X[as.character(mz),] <- quanti.m
+        
+        
+        
+    }
+    return(X)
+}
+
 imputeFunc <- function(file, missingValues, eSet, ptrSet) {
     
     fctFit <- getParameters(ptrSet)$detectPeakParam$fctFit
@@ -613,13 +768,22 @@ imputeFunc <- function(file, missingValues, eSet, ptrSet) {
     
     mzMissing <- as.numeric(rownames(missingValues[missingValues[, "col"] == j, , 
         drop = FALSE]))
+   
     
     # open mz Axis
     mzAxis <- rhdf5::h5read(filesFullName.j, name = "FullSpectra/MassAxis")
+    mzlim <-  range(mzAxis)
+    mzMissingOut<- which(mzMissing> mzlim[2] | mzMissing< mzlim[1]) 
+    if(length(mzMissingOut) !=0) mzMissing<- mzMissing[-mzMissingOut]
+    
     indexMzList <- lapply(unique(round(mzMissing)), function(m) which(m - 0.6 < mzAxis & 
         mzAxis < m + 0.6))
     names(indexMzList) <- unique(round(mzMissing))
     indexMz <- Reduce(union, indexMzList)
+    
+    
+  
+    
     
     # get index time
     indexLim <- getTimeInfo(ptrSet)$timeLimit[[file]]$exp
@@ -641,12 +805,14 @@ imputeFunc <- function(file, missingValues, eSet, ptrSet) {
     FirstcalibCoef <- try(rhdf5::h5read(filesFullName.j, "FullSpectra/MassCalibration", 
         index = list(NULL, 1)))
     attributCalib <- try(rhdf5::h5readAttributes(filesFullName.j, "/FullSpectra"))
+    
     if (!is.null(attr(FirstcalibCoef, "condition")) & is.null(attr(attributCalib, "condition"))) {
         FirstcalibCoef <- matrix(c(attributCalib$`MassCalibration a`, attributCalib$`MassCalibration b`), 
                             ncol = 1)
     }
     tof <- sqrt(mzAxis) * FirstcalibCoef[1, 1] + FirstcalibCoef[2, 1]
     coefCalib <- getCalibrationInfo(ptrSet)$coefCalib[[file]][[1]]
+    
     mzAxis <- ((tof - coefCalib["b", ])/coefCalib["a", ])^2
     
     # peak list raw
@@ -844,8 +1010,7 @@ impute <- function(eSet, ptrSet, parallelize = FALSE, nbCores = 2) {
 #' plotFeatures(exhaledPtrset,mz = 52.047,typePlot = "ggplot",colorBy = "subfolder")
 imputeMat <- function(X, ptrSet, quantiUnit) {
     # peak func(ion)
-    fctFit <- getPeaksInfo(ptrSet)$fctFit
-    
+
     # get index of missing values
     missingValues <- which(is.na(X), arr.ind = TRUE)
     indexFilesMissingValues <- unique(missingValues[, "col"])
@@ -860,6 +1025,7 @@ imputeMat <- function(X, ptrSet, quantiUnit) {
         filesFullName <- eval(filesFullName)
     
     for (file in namesFilesMissingValues) {
+        fctFit <- getPeaksInfo(ptrSet)$fctFit[[file]]
         j <- which(file == colnames(X))
         filesFullName.j <- filesFullName[which(basename(filesFullName) == file)]
         
@@ -870,6 +1036,8 @@ imputeMat <- function(X, ptrSet, quantiUnit) {
         mzAxis <- rhdf5::h5read(filesFullName.j, name = "FullSpectra/MassAxis")
         indexMzList <- lapply(unique(round(mzMissing)), function(m) which(m - 0.6 < 
             mzAxis & mzAxis < m + 0.6))
+        
+        
         names(indexMzList) <- unique(round(mzMissing))
         indexMz <- Reduce(union, indexMzList)
         
@@ -890,7 +1058,10 @@ imputeMat <- function(X, ptrSet, quantiUnit) {
         
         # information for ppb convertion
         reaction <- try(reaction <- rhdf5::h5read(filesFullName.j, "AddTraces/PTR-Reaction"))
+        ### format Ionicon
+        
         transmission <- try(rhdf5::h5read(filesFullName.j, "PTR-Transmission"))
+        ### format Ionicon
         
         # calibrate mass axis
         FirstcalibCoef <- rhdf5::h5read(filesFullName.j, "FullSpectra/MassCalibration", 
@@ -909,7 +1080,7 @@ imputeMat <- function(X, ptrSet, quantiUnit) {
             
             # mzAxis around m
             mzAxis.m <- mzAxis[indexMzList[[as.character(m)]]]
-            
+            if(length(mzAxis.m)==0) next
             indexExp <- Reduce(c, apply(indexLim, 2, function(x) seq(x[1], x[2])))
             length.exp <- length(indexExp)
             quantiMat <- matrix(0, ncol = length(mz), nrow = nbExp)
@@ -924,22 +1095,63 @@ imputeMat <- function(X, ptrSet, quantiUnit) {
             peakAlsoDetected <- peakListRaw.j[round(peakListRaw.j$Mz) == m, ]
             if (nrow(peakAlsoDetected) != 0) {
                 # cumFitPeak
-                funEVAL<-function(x) eval(parse(text = fctFit[[file]]))(x["Mz"], 
+                funEVAL<-function(x) eval(parse(text = fctFit))(x["Mz"], 
                                                                         x["parameterPeak.delta1"], 
                                                                         x["parameterPeak.delta2"], 
                                                                         x["parameterPeak.height"], 
                                                                         x = mzAxis.m, 
                                                                         l.shape = getPeaksInfo(ptrSet)$peakShape[[file]])
                 fitPeaks <- apply(peakAlsoDetected, 1, funEVAL )
-                if (nrow(peakAlsoDetected) > 1) 
-                  cumFitPeak <- rowSums(fitPeaks) else cumFitPeak <- c(fitPeaks)
+                if(all(is.na(fitPeaks))){
+                    resolution_upper <- ceiling (max(ptrSet@resolution[[file]])/1000)*1000 +1000
+                    resolution_mean <- round(mean(ptrSet@resolution[[file]])/100)*100
+                    resolution_lower <- floor(min(ptrSet@resolution[[file]])/1000)*1000-500
+                    
+                    
+                    
+                    n.peak <- nrow(peakAlsoDetected)
+                    mass<-peakAlsoDetected$Mz
+                    delta <- rep(m/resolution_mean, 2 * n.peak)
+                    h <- vapply(mass, function(m) max(max(spectrum[which(abs(mzAxis.m - m) < 
+                                                                           (m * 50/10^6))]), 1), 0)
+                    
+                    
+                    initMz <- matrix(c(mass, delta/2, h), nrow = n.peak)
+                    colnames(initMz) <- c("m", "delta1", "delta2", "h")
+                    
+                    lower.cons <- c(t(initMz * matrix(c(rep(1, n.peak), rep(0, n.peak * 2), 
+                                                        rep(0.1, n.peak)), ncol = 4) - 
+                                          matrix(c(initMz[, "m"]/(resolution_mean * 100), 
+                                                   -initMz[, "m"]/(resolution_upper*2), 
+                                                   -initMz[, "m"]/(resolution_upper*2), 
+                                                   rep(0, n.peak)), 
+                                                 ncol = 4)))
+                    
+                    upper.cons <- c(t(initMz * matrix(c(rep(1, n.peak), rep(0, n.peak * 2), 
+                                                        rep(Inf, n.peak)), ncol = 4) + 
+                                          matrix(c(initMz[, "m"]/(resolution_mean *100), 
+                                                   initMz[, "m"]/(resolution_lower*2), 
+                                                   initMz[, "m"]/(resolution_lower*2), 
+                                                   rep(0, n.peak)), ncol = 4)))
+                    fit <- fitPeak(initMz, spectrum, mzAxis.m, lower.cons, upper.cons, fctFit, 
+                                   l.shape = getPeaksInfo(ptrSet)$peakShape[[file]])
+                    
+                    fitPeaks <- fit$fit.peak
+                    
+                }
+               
+                if (length(dim(fitPeaks)) > 1 ) 
+                    cumFitPeak <- rowSums(fitPeaks) else cumFitPeak <- c(fitPeaks)
                 spectrum <- spectrum - cumFitPeak
+                
+                spectrum[spectrum<0]<-0
             }
             
             # fit on the missing values
-            resolution_upper <- 8000
-            resolution_mean <- 5000
-            resolution_lower <- 3000
+            resolution_upper <- ceiling (max(ptrSet@resolution[[file]])/1000)*1000
+            resolution_mean <- round(mean(ptrSet@resolution[[file]])/100)*100
+            resolution_lower <- floor(min(ptrSet@resolution[[file]])/1000)*1000
+            
             
             n.peak <- length(mz)
             delta <- rep(m/resolution_mean, 2 * n.peak)
@@ -966,7 +1178,7 @@ imputeMat <- function(X, ptrSet, quantiUnit) {
                 rep(0, n.peak)), ncol = 4)))
             
             
-            fit <- fitPeak(initMz, spectrum, mzAxis.m, lower.cons, upper.cons, fctFit[[file]], 
+            fit <- fitPeak(initMz, spectrum, mzAxis.m, lower.cons, upper.cons, fctFit, 
                 l.shape = getPeaksInfo(ptrSet)$peakShape[[file]])
             
             fit.peak <- fit$fit.peak
@@ -1001,6 +1213,7 @@ imputeMat <- function(X, ptrSet, quantiUnit) {
             
             
             # add to peak table
+            
             X[as.character(mz), file] <- quanti.m
         }
         message(basename(file), " done")
